@@ -97,6 +97,7 @@ type Raft struct {
 	// Volatile state for follower.
 	// Volatile state for candiate.
 	electionTime time.Time
+	rpcTimer     *time.Timer
 }
 
 // return currentTerm and whether this server
@@ -208,6 +209,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 }
 
 func (rf *Raft) rpcCall(server int, name string, args interface{}, reply interface{}) bool {
+	if !rf.rpcTimer.Stop() {
+		select {
+		case <-rf.rpcTimer.C:
+		default:
+		}
+	}
+
+	rf.rpcTimer.Reset(time.Millisecond * 10)
 	ch := make(chan AsyncRpc, 1)
 	go func(ch chan AsyncRpc) {
 		ok := rf.peers[server].Call(name, args, reply)
@@ -219,7 +228,7 @@ func (rf *Raft) rpcCall(server int, name string, args interface{}, reply interfa
 	select {
 	case async := <-ch:
 		return async.ok
-	case <-time.After(time.Millisecond * 10):
+	case <-rf.rpcTimer.C:
 		return false
 	}
 }
@@ -386,6 +395,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.electionTime = time.Now()
+	rf.rpcTimer = time.NewTimer(time.Millisecond * 10)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
