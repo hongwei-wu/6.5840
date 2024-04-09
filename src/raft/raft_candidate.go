@@ -27,6 +27,7 @@ func (rf *Raft) startElection() {
 			votes += 1
 			continue
 		}
+		reply = RequestVoteReply{}
 		ok := rf.sendRequestVote(i, args, &reply)
 		if !ok {
 			continue
@@ -58,6 +59,7 @@ func (rf *Raft) brodcastHeartbeat() {
 			continue
 		}
 
+		reply = AppendEntriesReply{}
 		ok := rf.sendAppendEntries(i, args, &reply)
 		if !ok {
 			continue
