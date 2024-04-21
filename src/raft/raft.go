@@ -58,13 +58,13 @@ const (
 )
 
 type RaftEntry struct {
-	Term  uint64
-	Index uint64
+	Term  int
+	Index int
 }
 
 type FollowerState struct {
-	NextIndex  uint64
-	MatchIndex uint64
+	NextIndex  int
+	MatchIndex int
 }
 
 // A Go object implementing a single Raft peer.
@@ -79,14 +79,14 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
-	currentTerm uint64 // the current term
+	currentTerm int// the current term
 	votedFor    int    // the peer that voted for this term
 	entries     []RaftEntry
 
 	// Volatile state for all servers.
-	commitIndex           uint64
-	lastApplied           uint64
-	state                 int64
+	commitIndex           int
+	lastApplied           int
+	state                 int
 	electionTimeout       time.Duration
 	randomElectionTimeout time.Duration
 	heartbeatTimeout      time.Duration
@@ -164,32 +164,32 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (3A, 3B).
-	Term             uint64
+	Term            int
 	CandidateId      int
-	LastLogIndex     uint64
-	LastLogIndexTerm uint64
+	LastLogIndex    int
+	LastLogIndexTerm int
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (3A).
-	Term        uint64
+	Term       int
 	VoteGranted int
 }
 
 type AppendEntriesArgs struct {
-	Term         uint64
-	PrevLogIndex uint64
-	PrevLogTerm  uint64
+	Term        int
+	PrevLogIndex int
+	PrevLogTerm int
 	Entries      []RaftEntry
-	LeaderCommit uint64
+	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
-	Term         uint64
+	Term        int
 	Success      bool
-	LastLogIndex uint64
+	LastLogIndex int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -313,8 +313,11 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
-	term := -1
-	isLeader := true
+
+	term, isLeader := rf.GetState()
+	if !isLeader {
+		return -1, -1, false
+	}
 
 	// Your code here (3B).
 
