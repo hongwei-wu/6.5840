@@ -2,24 +2,32 @@ package raft
 
 import (
 	"time"
-
-	"6.5840/log"
 )
 
 func (rf *Raft) tickCandidate() {
 	if rf.electionTime.Add(rf.randomElectionTimeout).Before(time.Now()) {
 		rf.startElection()
+		rf.randomElectionTimeout = randomElectionTimeout(rf.electionTimeout)
+		rf.electionTime = time.Now()
 		return
 	}
 }
 
 func (rf *Raft) startElection() {
 	rf.currentTerm += 1
-	log.Debugf("%d change term %d", rf.me, rf.currentTerm)
+	rf.Debugf("change term %d", rf.currentTerm)
+
+	var entry *RaftEntry
 
 	args := &RequestVoteArgs{Term: rf.currentTerm,
-		CandidateId: rf.me, LastLogIndex: 0, LastLogIndexTerm: 0}
-	var reply RequestVoteReply
+		CandidateId: rf.me, LastLogIndex: 0, LastLogTerm: 0}
+
+
+	if rf.entryLastIndex()  != 0 {
+		entry = rf.entryAt(rf.entryLastIndex())
+		args.LastLogIndex = entry.Index
+		args.LastLogTerm = entry.Term
+	}
 
 	votes := 0
 	for i := range rf.peers {
@@ -27,52 +35,26 @@ func (rf *Raft) startElection() {
 			votes += 1
 			continue
 		}
-		reply = RequestVoteReply{}
+		reply := RequestVoteReply{}
 		ok := rf.sendRequestVote(i, args, &reply)
 		if !ok {
 			continue
 		}
 
 		if reply.VoteGranted == 0 {
+			if reply.Term > rf.currentTerm {
+				rf.becomeFollower()
+				break
+			}
 			continue
 		}
 
-		log.Debugf("%d get vote from %d, term %d/%d", rf.me, i, rf.currentTerm, reply.Term)
+		rf.Debugf("get vote from %d, term %d/%d", i, rf.currentTerm, reply.Term)
 		votes += 1
 	}
 
 	if votes >= len(rf.peers)/2+1 {
 		rf.becomeLeader()
-		rf.brodcastHeartbeat()
-	}
-
-}
-
-func (rf *Raft) brodcastHeartbeat() {
-	args := &AppendEntriesArgs{Term: rf.currentTerm}
-	var reply AppendEntriesReply
-
-	votes := 0
-	for i := range rf.peers {
-		if i == rf.me {
-			votes += 1
-			continue
-		}
-
-		reply = AppendEntriesReply{}
-		ok := rf.sendAppendEntries(i, args, &reply)
-		if !ok {
-			continue
-		}
-
-		if !reply.Success {
-			continue
-		}
-
-		votes += 1
-	}
-
-	if votes >= len(rf.peers)/2+1 {
-		rf.electionTime = time.Now()
 	}
 }
+

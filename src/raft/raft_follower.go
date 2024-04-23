@@ -8,4 +8,5 @@ func (rf *Raft) tickFollower() {
 		rf.startElection()
 		return
 	}
+	rf.triggerApply()
 }
