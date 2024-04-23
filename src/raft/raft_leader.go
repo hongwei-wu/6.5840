@@ -47,28 +47,37 @@ func (rf *Raft) isLeaderLeaseValid() bool {
 func (rf *Raft) replicateEntries(i int, prevLogIndex int, prevLogTerm int, entries []*RaftEntry) (*AppendEntriesReply, bool) {
 	args := &AppendEntriesArgs{Term: rf.currentTerm,
 		LeaderCommit: rf.commitIndex,
-		LeaderId: rf.me,
+		LeaderId:     rf.me,
 		Entries:      entries,
 		PrevLogIndex: prevLogIndex,
 		PrevLogTerm:  prevLogTerm}
 	reply := AppendEntriesReply{}
 
+	for i := 0; i < len(entries); i++ {
+		if entries[i].Index != prevLogIndex+i+1 {
+			panic("invalid entry index")
+		}
+	}
+
+	rf.Debugf("send %d ae term %d prev index %d prev term %d entries %d leader %d commit %d",
+		i, args.Term, args.PrevLogIndex, args.PrevLogTerm, len(args.Entries), args.LeaderId, args.LeaderCommit)
 	ok := rf.sendAppendEntries(i, args, &reply)
 	if !ok {
 		return nil, false
 	}
+	rf.Debugf("recv %d aer term %d last index %d success %t", i, reply.Term, reply.LastLogIndex, reply.Success)
 	return &reply, true
 }
 
-func (rf *Raft)updateCommit(index int) {
+func (rf *Raft) updateCommit(index int) {
 	if index <= rf.commitIndex {
 		return
 	}
 
-	votes :=0
-	for i :=range rf.peerStates {
+	votes := 0
+	for i := range rf.peerStates {
 		if i == rf.me {
-			votes +=1
+			votes += 1
 		}
 		if rf.peerStates[i].MatchIndex < index {
 			continue

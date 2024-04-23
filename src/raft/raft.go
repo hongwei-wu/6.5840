@@ -223,6 +223,9 @@ func (rf *Raft) deleteConflictEntries(entries []*RaftEntry) (int, bool) {
 			return i, true
 		}
 		if entry.Term != entries[i].Term {
+			rf.Debugf("entry term diff, index %d term %d/%d",
+				entry.Index, entry.Term, entries[i].Term)
+			rf.entryPopFromIndx(entry.Index)
 			return i, true
 		}
 	}
@@ -233,6 +236,8 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 	reply.Term = rf.currentTerm
 	reply.Success = false
 
+	rf.Debugf("recv %d ae term %d prev index %d prev term %d entries %d leader %d commit %d",
+		args.LeaderId, args.Term, args.PrevLogIndex, args.PrevLogTerm, len(args.Entries), args.LeaderId, args.LeaderCommit)
 	if args.Term < rf.currentTerm {
 		return
 	}
@@ -243,7 +248,8 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 	rf.currentTerm = args.Term
 	rf.electionTime = time.Now()
 
-	rf.Debugf("recv append entries %d", len(args.Entries))
+	rf.Debugf("recv append entries %d, local entries %d",
+		len(args.Entries), rf.entryLastIndex())
 
 	if !rf.checkPrevEntry(args.PrevLogIndex, args.PrevLogTerm) {
 		reply.Success = false
@@ -315,7 +321,8 @@ func (rf *Raft) handelRequestVote(args *RequestVoteArgs, reply *RequestVoteReply
 	reply.VoteGranted = 0
 	var entry *RaftEntry
 
-	rf.Debugf("recv rv term %d candidate id %d last index %d last term %d",
+	rf.Debugf("recv %d rv term %d candidate id %d last index %d last term %d",
+		args.CandidateId,
 		args.Term, args.CandidateId, args.LastLogIndex, args.LastLogTerm)
 	if rf.state == Leader || (rf.state == Follower && rf.currentLeader != -1) {
 		rf.Debugf("still has leader, reject rv")
@@ -364,6 +371,7 @@ granted:
 	if rf.state != Follower {
 		rf.becomeFollower()
 	}
+	rf.electionTime = time.Now()
 }
 
 // example RequestVote RPC handler.
@@ -532,6 +540,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (3A, 3B, 3C).
 	rf.applyCh = applyCh
 	rf.currentTerm = 1
+	rf.currentLeader = -1
 	rf.votedFor = 0
 	rf.entries = make([]*RaftEntry, 0)
 	rf.rpcCh = make(chan *AsyncRpc)
@@ -562,10 +571,11 @@ func (rf *Raft) triggerApply() {
 	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 		entry := rf.entryAt(i)
 		if entry == nil {
-			rf.Debugf("null entry at %d last %d", i, rf.entryLastIndex())
+			rf.Errf("null entry at %d last %d", i, rf.entryLastIndex())
 			panic("")
 		}
 		if entry.Index != rf.lastApplied+1 {
+			rf.Errf("invalid entry index %d", entry.Index)
 			panic("")
 		}
 		msg := ApplyMsg{CommandValid: true, Command: entry.Command, CommandIndex: entry.Index}

@@ -22,8 +22,7 @@ func (rf *Raft) startElection() {
 	args := &RequestVoteArgs{Term: rf.currentTerm,
 		CandidateId: rf.me, LastLogIndex: 0, LastLogTerm: 0}
 
-
-	if rf.entryLastIndex()  != 0 {
+	if rf.entryLastIndex() != 0 {
 		entry = rf.entryAt(rf.entryLastIndex())
 		args.LastLogIndex = entry.Index
 		args.LastLogTerm = entry.Term
@@ -35,6 +34,9 @@ func (rf *Raft) startElection() {
 			votes += 1
 			continue
 		}
+
+		rf.Debugf("send %d rv term %d candidate id %d last index %d last term %d",
+			i, args.Term, args.CandidateId, args.LastLogIndex, args.LastLogTerm)
 		reply := RequestVoteReply{}
 		ok := rf.sendRequestVote(i, args, &reply)
 		if !ok {
@@ -57,4 +59,3 @@ func (rf *Raft) startElection() {
 		rf.becomeLeader()
 	}
 }
-
