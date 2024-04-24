@@ -88,7 +88,6 @@ type Raft struct {
 	rpcCh chan *AsyncRpc
 	// volatile state
 	electionTime time.Time
-	rpcTimer     *time.Timer
 
 	// Volatile state for all servers.
 	commitIndex           int
@@ -175,6 +174,7 @@ type RequestVoteArgs struct {
 	CandidateId  int
 	LastLogIndex int
 	LastLogTerm  int
+	PreVote      bool
 }
 
 // example RequestVote RPC reply structure.
@@ -288,14 +288,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 }
 
 func (rf *Raft) rpcCall(server int, name string, args interface{}, reply interface{}) bool {
-	if !rf.rpcTimer.Stop() {
-		select {
-		case <-rf.rpcTimer.C:
-		default:
+	now := time.Now()
+	defer func(pre time.Time) {
+		if pre.Add(time.Millisecond * 30).Before(time.Now()) {
+			rf.Errf("rpc timeout %s.", time.Now().Sub(pre).String())
 		}
-	}
+	}(now)
 
-	rf.rpcTimer.Reset(time.Millisecond * 20)
 	ch := make(chan AsyncRpcRequest, 1)
 	go func(ch chan AsyncRpcRequest) {
 		ok := rf.peers[server].Call(name, args, reply)
@@ -307,7 +306,7 @@ func (rf *Raft) rpcCall(server int, name string, args interface{}, reply interfa
 	select {
 	case async := <-ch:
 		return async.ok
-	case <-rf.rpcTimer.C:
+	case <-time.After(time.Millisecond * 20):
 		return false
 	}
 }
@@ -333,6 +332,10 @@ func (rf *Raft) handelRequestVote(args *RequestVoteArgs, reply *RequestVoteReply
 		return
 	}
 
+	if args.PreVote {
+		goto compare_log
+	}
+
 	if args.Term == rf.currentTerm && (rf.votedFor != 0 && rf.votedFor != args.CandidateId) {
 		rf.Debugf("already vote %d at term %d", rf.votedFor, rf.currentTerm)
 		return
@@ -342,7 +345,7 @@ func (rf *Raft) handelRequestVote(args *RequestVoteArgs, reply *RequestVoteReply
 		rf.Debugf("already vote %d, grant again", args.CandidateId)
 		goto granted
 	}
-
+compare_log:
 	if rf.entryLastIndex() == 0 {
 		rf.Debugf("local empty entrieis, grant")
 		goto granted
@@ -365,13 +368,15 @@ func (rf *Raft) handelRequestVote(args *RequestVoteArgs, reply *RequestVoteReply
 	return
 granted:
 	reply.VoteGranted = 1
-	rf.votedFor = args.CandidateId
-	rf.currentTerm = args.Term
+	if !args.PreVote {
+		rf.votedFor = args.CandidateId
+		rf.currentTerm = args.Term
 
-	if rf.state != Follower {
-		rf.becomeFollower()
+		if rf.state != Follower {
+			rf.becomeFollower()
+		}
+		rf.electionTime = time.Now()
 	}
-	rf.electionTime = time.Now()
 }
 
 // example RequestVote RPC handler.
@@ -552,7 +557,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.electionTime = time.Now()
-	rf.rpcTimer = time.NewTimer(time.Millisecond * 10)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())

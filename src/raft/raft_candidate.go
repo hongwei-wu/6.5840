@@ -6,21 +6,31 @@ import (
 
 func (rf *Raft) tickCandidate() {
 	if rf.electionTime.Add(rf.randomElectionTimeout).Before(time.Now()) {
-		rf.startElection()
+		if !rf.startElection(true) {
+			goto reset_election_timeout
+		}
+		rf.startElection(false)
+	reset_election_timeout:
 		rf.randomElectionTimeout = randomElectionTimeout(rf.electionTimeout)
 		rf.electionTime = time.Now()
 		return
 	}
 }
 
-func (rf *Raft) startElection() {
-	rf.currentTerm += 1
-	rf.Debugf("change term %d", rf.currentTerm)
+func (rf *Raft) startElection(preVote bool) bool {
+	if !preVote {
+		rf.currentTerm += 1
+		rf.Debugf("change term %d", rf.currentTerm)
+	}
 
 	var entry *RaftEntry
-
 	args := &RequestVoteArgs{Term: rf.currentTerm,
-		CandidateId: rf.me, LastLogIndex: 0, LastLogTerm: 0}
+		CandidateId: rf.me, LastLogIndex: 0, LastLogTerm: 0,
+		PreVote: preVote}
+
+	if preVote {
+		args.Term = rf.currentTerm + 1
+	}
 
 	if rf.entryLastIndex() != 0 {
 		entry = rf.entryAt(rf.entryLastIndex())
@@ -45,6 +55,8 @@ func (rf *Raft) startElection() {
 
 		if reply.VoteGranted == 0 {
 			if reply.Term > rf.currentTerm {
+				rf.Debugf("rvr bigger term %d", reply.Term)
+				rf.currentTerm = reply.Term
 				rf.becomeFollower()
 				break
 			}
@@ -55,7 +67,12 @@ func (rf *Raft) startElection() {
 		votes += 1
 	}
 
-	if votes >= len(rf.peers)/2+1 {
-		rf.becomeLeader()
+	win := votes >= len(rf.peers)/2+1
+
+	if !preVote {
+		if win {
+			rf.becomeLeader()
+		}
 	}
+	return win
 }

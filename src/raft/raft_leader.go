@@ -102,6 +102,9 @@ func (rf *Raft) peerReplicateEntries(i int) bool {
 		prevLogTerm = 0
 	} else {
 		entry := rf.entryAt(p.NextIndex - 1)
+		if entry == nil {
+			rf.Errf("peer %d no entry at index %d last index %d", i, p.NextIndex-1, rf.entryLastIndex())
+		}
 		prevLogIndex = entry.Index
 		prevLogTerm = entry.Term
 	}
@@ -124,11 +127,17 @@ func (rf *Raft) peerReplicateEntries(i int) bool {
 		return true
 	}
 
-	p.MatchIndex = reply.LastLogIndex
-	p.NextIndex = p.MatchIndex + 1
+	if p.MatchIndex != reply.LastLogIndex && reply.LastLogIndex <= rf.entryLastIndex() {
+		entry:=rf.entryAt(reply.LastLogIndex)
+		if (entry.Term != rf.currentTerm) {
+			return true
+		}
+		p.MatchIndex = reply.LastLogIndex
+		p.NextIndex = p.MatchIndex + 1
 
-	rf.Debugf("%d match index %d", i, p.MatchIndex)
-	rf.updateCommit(p.MatchIndex)
+		rf.Debugf("%d match index %d", i, p.MatchIndex)
+		rf.updateCommit(p.MatchIndex)
+	}
 
 	return true
 }
