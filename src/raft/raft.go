@@ -275,6 +275,8 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 	if args.LeaderCommit > rf.commitIndex && args.LeaderCommit >= rf.entryLastIndex() {
 		rf.commitIndex = args.LeaderCommit
 		rf.Debugf("update commit index %d", rf.commitIndex)
+
+		rf.triggerApply()
 	}
 
 	rf.currentLeader = args.LeaderId
@@ -293,23 +295,22 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 func (rf *Raft) rpcCall(server int, name string, args interface{}, reply interface{}) bool {
 	now := time.Now()
 	defer func(pre time.Time) {
-		if pre.Add(time.Millisecond * 30).Before(time.Now()) {
+		if pre.Add(time.Millisecond * 10).Before(time.Now()) {
 			rf.Errf("rpc timeout %s.", time.Now().Sub(pre).String())
 		}
 	}(now)
 
 	ch := make(chan AsyncRpcRequest, 1)
 	go func(ch chan AsyncRpcRequest) {
+		defer close(ch)
 		ok := rf.peers[server].Call(name, args, reply)
 		ch <- AsyncRpcRequest{args, reply, ok}
-		close(ch)
-
 	}(ch)
 
 	select {
 	case async := <-ch:
 		return async.ok
-	case <-time.After(time.Millisecond * 20):
+	case <-time.After(time.Millisecond * 5):
 		return false
 	}
 }
@@ -522,6 +523,7 @@ func (rf *Raft) ticker() {
 		case <-time.After(rf.heartbeatTimeout):
 			rf.tick()
 		}
+
 	}
 }
 

@@ -69,9 +69,9 @@ func (rf *Raft) replicateEntries(i int, prevLogIndex int, prevLogTerm int, entri
 	return &reply, true
 }
 
-func (rf *Raft) updateCommit(index int) {
+func (rf *Raft) updateCommit(index int) bool {
 	if index <= rf.commitIndex {
-		return
+		return false
 	}
 
 	votes := 0
@@ -89,7 +89,9 @@ func (rf *Raft) updateCommit(index int) {
 	if votes >= len(rf.peers)/2+1 {
 		rf.commitIndex = index
 		rf.Debugf("update commit index %d", index)
+		return true
 	}
+	return false
 }
 
 func (rf *Raft) peerReplicateEntries(i int) bool {
@@ -136,7 +138,9 @@ func (rf *Raft) peerReplicateEntries(i int) bool {
 		p.NextIndex = p.MatchIndex + 1
 
 		rf.Debugf("%d match index %d", i, p.MatchIndex)
-		rf.updateCommit(p.MatchIndex)
+		if rf.updateCommit(p.MatchIndex) {
+			rf.triggerApply()
+		}
 	}
 
 	return true
