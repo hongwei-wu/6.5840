@@ -85,7 +85,7 @@ type Raft struct {
 	votedFor    int // the peer that voted for this term
 	entries     []*RaftEntry
 
-	rpcCh chan *AsyncRpc
+	taskCh chan func()
 	// volatile state
 	electionTime time.Time
 
@@ -281,10 +281,13 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rpc := &AsyncRpc{args: args, reply: reply, name: "AppendEntries", doneC: make(chan interface{})}
+	doneC := make(chan interface{})
 
-	rf.rpcCh <- rpc
-	<-rpc.doneC
+	rf.taskCh <- func() {
+		defer close(doneC)
+		rf.handleAppendEntries(args, reply)
+	}
+	<-doneC
 }
 
 func (rf *Raft) rpcCall(server int, name string, args interface{}, reply interface{}) bool {
@@ -382,23 +385,19 @@ granted:
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
-	rpc := &AsyncRpc{args: args, reply: reply, name: "RequestVote", doneC: make(chan interface{})}
+	doneC := make(chan interface{})
 
-	rf.rpcCh <- rpc
-	<-rpc.doneC
+	rf.taskCh <- func() {
+		defer close(doneC)
+		rf.handelRequestVote(args, reply)
+	}
+	<-doneC
 }
 
 type AsyncRpcRequest struct {
 	args  interface{}
 	reply interface{}
 	ok    bool
-}
-
-type AsyncRpc struct {
-	args  interface{}
-	reply interface{}
-	name  string
-	doneC chan interface{}
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -451,13 +450,26 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 
 	// Your code here (3B).
+	result := &struct {
+		Index int
+		Term  int
+	}{}
+	doneC := make(chan interface{})
 
-	entry := &RaftEntry{Term: rf.currentTerm, Index: rf.entryLastIndex() + 1, Command: command}
+	rf.taskCh <- func() {
+		defer close(doneC)
 
-	rf.Debugf("append entry at %d term %d", entry.Index, entry.Term)
-	rf.entryAppend([]*RaftEntry{entry})
-	rf.broadCastEntries()
-	return entry.Index, entry.Term, true
+		entry := &RaftEntry{Term: rf.currentTerm, Index: rf.entryLastIndex() + 1, Command: command}
+
+		rf.Debugf("append entry at %d term %d", entry.Index, entry.Term)
+		rf.entryAppend([]*RaftEntry{entry})
+		rf.broadCastEntries()
+		result.Index = entry.Index
+		result.Term = entry.Term
+	}
+	<-doneC
+
+	return result.Index, result.Term, true
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -477,19 +489,6 @@ func (rf *Raft) Kill() {
 func (rf *Raft) killed() bool {
 	z := atomic.LoadInt32(&rf.dead)
 	return z == 1
-}
-
-func (rf *Raft) handleRpc(rpc *AsyncRpc) {
-	defer close(rpc.doneC)
-
-	switch rpc.name {
-	case "AppendEntries":
-		rf.handleAppendEntries(rpc.args.(*AppendEntriesArgs), rpc.reply.(*AppendEntriesReply))
-	case "RequestVote":
-		rf.handelRequestVote(rpc.args.(*RequestVoteArgs), rpc.reply.(*RequestVoteReply))
-	default:
-		panic(rpc.name)
-	}
 }
 
 func (rf *Raft) tick() {
@@ -518,8 +517,8 @@ func (rf *Raft) ticker() {
 		//ms := 50 + (rand.Int63() % 300)
 		//time.Sleep(time.Duration(ms) * time.Millisecond)
 		select {
-		case rpc := <-rf.rpcCh:
-			rf.handleRpc(rpc)
+		case task := <-rf.taskCh:
+			task()
 		case <-time.After(rf.heartbeatTimeout):
 			rf.tick()
 		}
@@ -548,7 +547,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentLeader = -1
 	rf.votedFor = 0
 	rf.entries = make([]*RaftEntry, 0)
-	rf.rpcCh = make(chan *AsyncRpc)
+	rf.taskCh = make(chan func())
 
 	rf.electionTimeout = 600 * time.Millisecond
 	rf.randomElectionTimeout = randomElectionTimeout(rf.electionTimeout)
