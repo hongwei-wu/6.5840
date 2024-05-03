@@ -9,6 +9,7 @@ func (rf *Raft) tickCandidate() {
 		if !rf.startElection(true) {
 			goto reset_election_timeout
 		}
+		rf.Debugf("pre-vote succeed")
 		rf.startElection(false)
 	reset_election_timeout:
 		rf.randomElectionTimeout = randomElectionTimeout(rf.electionTimeout)
@@ -19,8 +20,7 @@ func (rf *Raft) tickCandidate() {
 
 func (rf *Raft) startElection(preVote bool) bool {
 	if !preVote {
-		rf.currentTerm += 1
-		rf.Debugf("change term %d", rf.currentTerm)
+		rf.updateTermAndVote(rf.currentTerm+1, rf.me)
 	}
 
 	var entry *RaftEntry
@@ -45,26 +45,36 @@ func (rf *Raft) startElection(preVote bool) bool {
 			continue
 		}
 
+		repeat := 0
 		rf.Debugf("send %d rv term %d candidate id %d last index %d last term %d",
 			i, args.Term, args.CandidateId, args.LastLogIndex, args.LastLogTerm)
+	retry:
+		repeat += 1
 		reply := RequestVoteReply{}
 		ok := rf.sendRequestVote(i, args, &reply)
 		if !ok {
+			if repeat < 3 {
+				goto retry
+			}
 			continue
 		}
 
 		if reply.VoteGranted == 0 {
 			if reply.Term > rf.currentTerm {
 				rf.Debugf("rvr bigger term %d", reply.Term)
-				rf.currentTerm = reply.Term
+				rf.updateTermAndVote(reply.Term, 0)
 				rf.becomeFollower()
 				break
 			}
 			continue
 		}
 
-		rf.Debugf("get vote from %d, term %d/%d", i, rf.currentTerm, reply.Term)
 		votes += 1
+		rf.Debugf("get vote from %d, term %d/%d, votes %d", i, rf.currentTerm, reply.Term, votes)
+
+		if votes >= len(rf.peers)/2+1 {
+			break
+		}
 	}
 
 	win := votes >= len(rf.peers)/2+1

@@ -20,8 +20,10 @@ func (rf *Raft) entryFromIndex(index int) []*RaftEntry {
 
 func(rf *Raft)entryAppend(entries []*RaftEntry) {
 	rf.entries = append(rf.entries, entries...)
+	rf.persist()
 }
 
 func (rf *Raft)entryPopFromIndx(index int) {
 	rf.entries = rf.entries[0:index-1]
+	rf.persist()
 }

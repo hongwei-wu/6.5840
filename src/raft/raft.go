@@ -20,12 +20,14 @@ package raft
 import (
 	//	"bytes"
 
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -119,6 +121,34 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isLeader
 }
 
+func (rf *Raft) encodeEntries(e *labgob.LabEncoder) {
+	e.Encode(len(rf.entries))
+	for i := range rf.entries {
+		entry := rf.entries[i]
+		e.Encode(entry.Term)
+		e.Encode(entry.Index)
+		e.Encode(entry.Command)
+		//rf.Debugf("encode entry index %d term %d command %v", entry.Index, entry.Term, entry.Command)
+	}
+}
+
+func (rf *Raft) decodeEntries(d *labgob.LabDecoder) {
+	var size int
+
+	d.Decode(&size)
+	for i := 0; i < size; i++ {
+		entry := &RaftEntry{}
+		d.Decode(&entry.Term)
+		d.Decode(&entry.Index)
+		var command int
+		d.Decode(&command)
+		entry.Command = command
+
+		//rf.Debugf("decode entry index %d term %d command %v", entry.Index, entry.Term, entry.Command)
+		rf.entries = append(rf.entries, entry)
+	}
+}
+
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
@@ -129,12 +159,14 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (3C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+
+	rf.encodeEntries(e)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 // restore previously persisted state.
@@ -144,17 +176,23 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (3C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var term int
+	if err := d.Decode(&term); err != nil {
+		rf.Errf("decode current term failed %s", err.Error())
+		return
+	}
+	rf.currentTerm = term
+
+	var votedFor int
+	if err := d.Decode(&votedFor); err != nil {
+		rf.Errf("decode voted for failed %s", err.Error())
+		return
+	}
+	rf.votedFor = votedFor
+	rf.decodeEntries(d)
 }
 
 // the service says it has created a snapshot that has
@@ -245,7 +283,9 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 	if rf.state != Follower {
 		rf.becomeFollower()
 	}
-	rf.currentTerm = args.Term
+	if args.Term > rf.currentTerm {
+		rf.updateTermAndVote(args.Term, 0)
+	}
 	rf.electionTime = time.Now()
 
 	rf.Debugf("recv append entries %d, local entries %d",
@@ -295,7 +335,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 func (rf *Raft) rpcCall(server int, name string, args interface{}, reply interface{}) bool {
 	now := time.Now()
 	defer func(pre time.Time) {
-		if pre.Add(time.Millisecond * 10).Before(time.Now()) {
+		if pre.Add(time.Millisecond * 35).Before(time.Now()) {
 			rf.Errf("rpc timeout %s.", time.Now().Sub(pre).String())
 		}
 	}(now)
@@ -310,7 +350,7 @@ func (rf *Raft) rpcCall(server int, name string, args interface{}, reply interfa
 	select {
 	case async := <-ch:
 		return async.ok
-	case <-time.After(time.Millisecond * 5):
+	case <-time.After(time.Millisecond * 30):
 		return false
 	}
 }
@@ -373,8 +413,7 @@ compare_log:
 granted:
 	reply.VoteGranted = 1
 	if !args.PreVote {
-		rf.votedFor = args.CandidateId
-		rf.currentTerm = args.Term
+		rf.updateTermAndVote(args.Term, args.CandidateId)
 
 		if rf.state != Follower {
 			rf.becomeFollower()
@@ -462,7 +501,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 		entry := &RaftEntry{Term: rf.currentTerm, Index: rf.entryLastIndex() + 1, Command: command}
 
-		rf.Debugf("append entry at %d term %d", entry.Index, entry.Term)
+		rf.Debugf("append entry at %d term %d command %v", entry.Index, entry.Term, command)
 		rf.entryAppend([]*RaftEntry{entry})
 		rf.broadCastEntries()
 		result.Index = entry.Index
@@ -562,6 +601,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	rf.Debugf("start term %d vote-for %d entries %d",
+		rf.currentTerm, rf.votedFor, len(rf.entries))
+
 	// start ticker goroutine to start elections
 	go rf.ticker()
 
@@ -589,3 +631,11 @@ func (rf *Raft) triggerApply() {
 		rf.Debugf("update applied %d", rf.lastApplied)
 	}
 }
+
+func (rf *Raft) updateTermAndVote(term int, vote int) {
+	rf.currentTerm = term
+	rf.votedFor = vote
+	rf.Debugf("change term %d vote for %d", rf.currentTerm, rf.votedFor)
+	rf.persist()
+}
+

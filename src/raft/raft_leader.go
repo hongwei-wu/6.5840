@@ -27,7 +27,7 @@ func (rf *Raft) brodcastHeartbeat() {
 			continue
 		}
 
-		if !rf.peerReplicateEntries(i) {
+		if !rf.peerReplicateEntries(i, true) {
 			continue
 		}
 		votes += 1
@@ -44,14 +44,13 @@ func (rf *Raft) isLeaderLeaseValid() bool {
 	return rf.electionTime.Add(rf.electionTimeout).After(time.Now())
 }
 
-func (rf *Raft) replicateEntries(i int, prevLogIndex int, prevLogTerm int, entries []*RaftEntry) (*AppendEntriesReply, bool) {
+func (rf *Raft) replicateEntries(i int, prevLogIndex int, prevLogTerm int, entries []*RaftEntry, retry bool) (*AppendEntriesReply, bool) {
 	args := &AppendEntriesArgs{Term: rf.currentTerm,
 		LeaderCommit: rf.commitIndex,
 		LeaderId:     rf.me,
 		Entries:      entries,
 		PrevLogIndex: prevLogIndex,
 		PrevLogTerm:  prevLogTerm}
-	reply := AppendEntriesReply{}
 
 	for i := 0; i < len(entries); i++ {
 		if entries[i].Index != prevLogIndex+i+1 {
@@ -61,8 +60,15 @@ func (rf *Raft) replicateEntries(i int, prevLogIndex int, prevLogTerm int, entri
 
 	rf.Debugf("send %d ae term %d prev index %d prev term %d entries %d leader %d commit %d",
 		i, args.Term, args.PrevLogIndex, args.PrevLogTerm, len(args.Entries), args.LeaderId, args.LeaderCommit)
+	repeat:=0
+retry:
+	reply := AppendEntriesReply{}
+	repeat += 1
 	ok := rf.sendAppendEntries(i, args, &reply)
 	if !ok {
+		if repeat < 3 && retry{
+			goto retry
+		}
 		return nil, false
 	}
 	rf.Debugf("recv %d aer term %d last index %d success %t", i, reply.Term, reply.LastLogIndex, reply.Success)
@@ -94,7 +100,7 @@ func (rf *Raft) updateCommit(index int) bool {
 	return false
 }
 
-func (rf *Raft) peerReplicateEntries(i int) bool {
+func (rf *Raft) peerReplicateEntries(i int, retry bool) bool {
 	var prevLogIndex int
 	var prevLogTerm int
 	p := rf.peerStates[i]
@@ -106,13 +112,14 @@ func (rf *Raft) peerReplicateEntries(i int) bool {
 		entry := rf.entryAt(p.NextIndex - 1)
 		if entry == nil {
 			rf.Errf("peer %d no entry at index %d last index %d", i, p.NextIndex-1, rf.entryLastIndex())
+			panic("")
 		}
 		prevLogIndex = entry.Index
 		prevLogTerm = entry.Term
 	}
 	entries := rf.entryFromIndex(p.NextIndex)
 
-	reply, ok := rf.replicateEntries(i, prevLogIndex, prevLogTerm, entries)
+	reply, ok := rf.replicateEntries(i, prevLogIndex, prevLogTerm, entries, retry)
 	if !ok {
 		return false
 	}
@@ -120,7 +127,7 @@ func (rf *Raft) peerReplicateEntries(i int) bool {
 	if reply.Term > rf.currentTerm {
 		rf.Debugf("aer bigger term %d", reply.Term)
 		rf.becomeFollower()
-		rf.currentTerm = reply.Term
+		rf.updateTermAndVote(reply.Term, 0)
 		return false
 	}
 
@@ -151,7 +158,7 @@ func (rf *Raft) broadCastEntries() {
 		if i == rf.me {
 			continue
 		}
-		rf.peerReplicateEntries(i)
+		rf.peerReplicateEntries(i, false)
 		if rf.state != Leader {
 			break
 		}
