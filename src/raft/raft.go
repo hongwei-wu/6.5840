@@ -65,8 +65,9 @@ type RaftEntry struct {
 }
 
 type PeerState struct {
-	NextIndex  int
-	MatchIndex int
+	NextIndex          int
+	MatchIndex         int
+	RecentResponseTime time.Time
 }
 
 // A Go object implementing a single Raft peer.
@@ -83,9 +84,10 @@ type Raft struct {
 
 	applyCh chan ApplyMsg
 
-	currentTerm int // the current term
-	votedFor    int // the peer that voted for this term
-	entries     []*RaftEntry
+	currentTerm            int // the current term
+	votedFor               int // the peer that voted for this term
+	entries                []*RaftEntry
+	entriesCompactionIndex int
 
 	taskCh chan func()
 	// volatile state
@@ -106,6 +108,13 @@ type Raft struct {
 	currentLeader int
 
 	// Volatile state for candiate.
+
+	// snapshot
+	leaderSnapshotIndex int
+
+	snapshotIndex int
+	snapshotTerm  int
+	snapshot      []byte
 }
 
 // return currentTerm and whether this server
@@ -163,10 +172,14 @@ func (rf *Raft) persist() {
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
+	e.Encode(rf.snapshotIndex)
+	e.Encode(rf.snapshotTerm)
 
+	e.Encode(rf.entriesCompactionIndex)
 	rf.encodeEntries(e)
 	raftstate := w.Bytes()
-	rf.persister.Save(raftstate, nil)
+
+	rf.persister.Save(raftstate, rf.snapshot)
 }
 
 // restore previously persisted state.
@@ -192,7 +205,58 @@ func (rf *Raft) readPersist(data []byte) {
 		return
 	}
 	rf.votedFor = votedFor
+
+	var index int
+	if err := d.Decode(&index); err != nil {
+		rf.Errf("decode snapshot index failed %s", err.Error())
+		return
+	}
+	rf.snapshotIndex = index
+
+	term = 0
+	if err := d.Decode(&term); err != nil {
+		rf.Errf("decode snapshot term failed %s", err.Error())
+		return
+	}
+	rf.snapshotTerm = term
+
+	index = 0
+	if err := d.Decode(&index); err != nil {
+		rf.Errf("decode entry compaction index failed %s", err.Error())
+		return
+	}
+	rf.entriesCompactionIndex = index
 	rf.decodeEntries(d)
+}
+
+// restore snapshot
+func (rf *Raft) readSnapshot(data []byte) {
+	if data == nil || len(data) < 1 {
+		return
+	}
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var index int
+	if err := d.Decode(&index); err != nil {
+		rf.Errf("decode snapshot index failed %s", err.Error())
+		return
+	}
+	rf.snapshotIndex = index
+
+	var term int
+	if err := d.Decode(&term); err != nil {
+		rf.Errf("decode snapshot term failed %s", err.Error())
+		return
+	}
+	rf.snapshotTerm = term
+
+	var snapshot []byte
+	if err := d.Decode(&snapshot); err != nil {
+		rf.Errf("decode snapshot failed %s", err.Error())
+		return
+	}
+	rf.snapshot = snapshot
 }
 
 // the service says it has created a snapshot that has
@@ -201,7 +265,7 @@ func (rf *Raft) readPersist(data []byte) {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
-
+	rf.doSnapshot(index, clone(snapshot))
 }
 
 // example RequestVote RPC arguments structure.
@@ -224,12 +288,13 @@ type RequestVoteReply struct {
 }
 
 type AppendEntriesArgs struct {
-	Term         int
-	PrevLogIndex int
-	PrevLogTerm  int
-	Entries      []*RaftEntry
-	LeaderCommit int
-	LeaderId     int
+	Term          int
+	PrevLogIndex  int
+	PrevLogTerm   int
+	Entries       []*RaftEntry
+	LeaderCommit  int
+	LeaderId      int
+	SnapshotIndex int
 }
 
 type AppendEntriesReply struct {
@@ -238,8 +303,23 @@ type AppendEntriesReply struct {
 	LastLogIndex int
 }
 
+type InstallSnapshot struct {
+	Term          int
+	SnapshotIndex int
+	SnapshotTerm  int
+	Snapshot      []byte
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
 func (rf *Raft) checkPrevEntry(prevIndex int, prevTerm int) bool {
 	if prevIndex == 0 {
+		return true
+	}
+
+	if prevIndex == rf.snapshotIndex && prevTerm == rf.snapshotTerm {
 		return true
 	}
 
@@ -287,6 +367,7 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 		rf.updateTermAndVote(args.Term, 0)
 	}
 	rf.electionTime = time.Now()
+	rf.leaderSnapshotIndex = args.SnapshotIndex
 
 	rf.Debugf("recv append entries %d, local entries %d",
 		len(args.Entries), rf.entryLastIndex())
@@ -306,7 +387,7 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 		return
 	}
 
-	rf.Debugf(" %d append entreis %d, commit %d/%d", i, len(args.Entries[i:]),
+	rf.Debugf("append entries %d/%d/%d, commit %d/%d", i, len(args.Entries[i:]), len(args.Entries),
 		rf.commitIndex, args.LeaderCommit)
 	rf.entryAppend(args.Entries[i:])
 	reply.Success = true
@@ -320,6 +401,16 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 	}
 
 	rf.currentLeader = args.LeaderId
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshot, reply *InstallSnapshotReply) {
+	doneC := make(chan interface{})
+
+	rf.taskCh <- func() {
+		defer close(doneC)
+		rf.handleInstallSnapshot(args, reply)
+	}
+	<-doneC
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -367,6 +458,9 @@ func (rf *Raft) handelRequestVote(args *RequestVoteArgs, reply *RequestVoteReply
 	rf.Debugf("recv %d rv term %d candidate id %d last index %d last term %d",
 		args.CandidateId,
 		args.Term, args.CandidateId, args.LastLogIndex, args.LastLogTerm)
+
+	lastEntryIndex := rf.snapshotIndex
+	lastEntryTerm := rf.snapshotTerm
 	if rf.state == Leader || (rf.state == Follower && rf.currentLeader != -1) {
 		rf.Debugf("still has leader, reject rv")
 		return
@@ -390,25 +484,26 @@ func (rf *Raft) handelRequestVote(args *RequestVoteArgs, reply *RequestVoteReply
 		goto granted
 	}
 compare_log:
-	if rf.entryLastIndex() == 0 {
-		rf.Debugf("local empty entrieis, grant")
-		goto granted
+
+	if rf.entryNum() != 0 {
+		entry = rf.entryAt(rf.entryLastIndex())
+		if entry.Term > rf.currentTerm {
+			panic("")
+		}
+		lastEntryIndex = rf.entryLastIndex()
+		lastEntryTerm = entry.Term
 	}
 
-	entry = rf.entryAt(rf.entryLastIndex())
-	if entry.Term > rf.currentTerm {
-		panic("")
-	}
-	if entry.Term < args.LastLogTerm {
+	if lastEntryTerm < args.LastLogTerm {
 		rf.Debugf("last term smaller, grant")
 		goto granted
 	}
 
-	if entry.Term == args.LastLogTerm && entry.Index <= args.LastLogIndex {
-		rf.Debugf("last entry older index %d term %d, grant", entry.Index, entry.Term)
+	if lastEntryTerm == args.LastLogTerm && lastEntryIndex <= args.LastLogIndex {
+		rf.Debugf("last entry older index %d term %d, grant", lastEntryIndex, lastEntryTerm)
 		goto granted
 	}
-	rf.Debugf("rv not grant, log index %d log term %d", entry.Index, entry.Term)
+	rf.Debugf("rv not grant, log index %d log term %d", lastEntryIndex, lastEntryTerm)
 	return
 granted:
 	reply.VoteGranted = 1
@@ -588,6 +683,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentLeader = -1
 	rf.votedFor = 0
 	rf.entries = make([]*RaftEntry, 0)
+	rf.entriesCompactionIndex = 0
 	rf.taskCh = make(chan func())
 
 	rf.electionTimeout = 600 * time.Millisecond
@@ -597,9 +693,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.electionTime = time.Now()
+	rf.snapshotIndex = 0
+	rf.snapshotTerm = 0
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+
+	rf.snapshot = persister.ReadSnapshot()
+	if rf.snapshotIndex != 0 {
+		rf.commitIndex = rf.snapshotIndex
+		rf.lastApplied = rf.snapshotIndex
+	}
 
 	rf.Debugf("start term %d vote-for %d entries %d",
 		rf.currentTerm, rf.votedFor, len(rf.entries))
@@ -638,4 +742,3 @@ func (rf *Raft) updateTermAndVote(term int, vote int) {
 	rf.Debugf("change term %d vote for %d", rf.currentTerm, rf.votedFor)
 	rf.persist()
 }
-

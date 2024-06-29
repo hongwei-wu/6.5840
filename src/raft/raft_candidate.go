@@ -32,10 +32,13 @@ func (rf *Raft) startElection(preVote bool) bool {
 		args.Term = rf.currentTerm + 1
 	}
 
-	if rf.entryLastIndex() != 0 {
+	if rf.entryNum() != 0 {
 		entry = rf.entryAt(rf.entryLastIndex())
 		args.LastLogIndex = entry.Index
 		args.LastLogTerm = entry.Term
+	} else if rf.snapshotIndex != 0 {
+		args.LastLogIndex = rf.snapshotIndex
+		args.LastLogTerm = rf.snapshotTerm
 	}
 
 	votes := 0

@@ -21,7 +21,7 @@ func (rf *Raft) stateToString(state int) string {
 }
 
 func (rf *Raft) Debugf(format string, a ...any) (n int, err error) {
-	return 0, nil
+	//return 0, nil
 	mu.Lock()
 	defer mu.Unlock()
 
