@@ -12,7 +12,11 @@ func (rf *Raft) tickLeader() {
 		rf.becomeFollower()
 		return
 	}
+	//lastApplied := rf.lastApplied
 	rf.triggerApply()
+	//rf.Errf("tick leader last %d commit %d applied %d/%d, min match %d", rf.entryLastIndex(),
+	//	rf.commitIndex, lastApplied, rf.lastApplied, rf.getMinMatchIndex())
+
 }
 
 func (rf *Raft) brodcastHeartbeat() {
@@ -84,6 +88,7 @@ func (rf *Raft) peerReplicateSnapshot(i int) bool {
 	rf.peerStates[i].MatchIndex = rf.snapshotIndex
 	rf.peerStates[i].NextIndex = rf.snapshotIndex + 1
 	rf.peerStates[i].RecentResponseTime = time.Now()
+	rf.peerStates[i].Pipeline = true
 	rf.Debugf("updater peer %d match index %d next index %d", i,
 		rf.snapshotIndex,
 		rf.snapshotIndex+1)
@@ -156,8 +161,7 @@ func (rf *Raft) peerReplicateEntries(i int, retry bool) bool {
 	if p.NextIndex == 1 {
 		prevLogIndex = 0
 		prevLogTerm = 0
-		entry := rf.entryAt(p.NextIndex)
-		if entry == nil {
+		if rf.snapshotIndex != 0 {
 			return rf.peerReplicateSnapshot(i)
 		}
 	} else {
@@ -167,7 +171,7 @@ func (rf *Raft) peerReplicateEntries(i int, retry bool) bool {
 		} else {
 			entry := rf.entryAt(p.NextIndex - 1)
 			if entry == nil {
-				rf.Errf("peer %d no entry at index %d last index %d", i, p.NextIndex-1, rf.entryLastIndex())
+				rf.Debugf("peer %d no entry at index %d last index %d", i, p.NextIndex-1, rf.entryLastIndex())
 				return rf.peerReplicateSnapshot(i)
 			}
 			prevLogIndex = entry.Index
@@ -190,28 +194,53 @@ func (rf *Raft) peerReplicateEntries(i int, retry bool) bool {
 	}
 
 	if !reply.Success {
-		p.NextIndex = p.MatchIndex + 1
+		if p.Pipeline {
+			p.MatchIndex = 0
+			p.NextIndex = rf.entryLastIndex()
+			p.RecentResponseTime = time.Now()
+			p.Pipeline = false
+			return true
+		}
+
+		if prevLogIndex < reply.LastLogIndex + 1{
+			p.NextIndex = prevLogIndex
+		} else {
+		p.NextIndex = reply.LastLogIndex + 1
+		}
 		return true
 	}
 
-	if p.MatchIndex != reply.LastLogIndex && reply.LastLogIndex <= rf.entryLastIndex() {
-		entry := rf.entryAt(reply.LastLogIndex)
-		if entry.Term != rf.currentTerm {
-			return true
-		}
-		p.MatchIndex = reply.LastLogIndex
-		p.NextIndex = p.MatchIndex + 1
 
-		rf.Debugf("%d match index %d", i, p.MatchIndex)
-		if rf.updateCommit(p.MatchIndex) {
-			rf.triggerApply()
-		}
+	p.Pipeline = true
+	if reply.LastLogIndex > rf.entryLastIndex() {
+		reply.LastLogIndex = rf.entryLastIndex()
+		rf.Errf("peer %d change lastLogIndex %d", i, reply.LastLogIndex)
 	}
+
+	if p.MatchIndex >= reply.LastLogIndex {
+		return true
+	}
+	p.MatchIndex = reply.LastLogIndex
+	p.NextIndex = p.MatchIndex + 1
+	rf.Debugf("%d match index %d", i, p.MatchIndex)
+
+	entry := rf.entryAt(reply.LastLogIndex)
+	if entry == nil {
+		rf.Fatalf("entries %d %d reply.last %d",
+			rf.entriesCompactionIndex, rf.entryNum(), reply.LastLogIndex)
+
+	}
+	if entry.Term != rf.currentTerm {
+		return true
+	}
+	rf.updateCommit(p.MatchIndex)
 
 	return true
 }
 
 func (rf *Raft) broadCastEntries() {
+again:
+	commitIndex := rf.commitIndex
 	for i := range rf.peerStates {
 		if i == rf.me {
 			continue
@@ -221,4 +250,9 @@ func (rf *Raft) broadCastEntries() {
 			break
 		}
 	}
+
+	if commitIndex != rf.commitIndex {
+		goto again
+	}
+	rf.triggerApply()
 }

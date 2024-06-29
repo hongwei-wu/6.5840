@@ -33,6 +33,7 @@ func (rf *Raft) becomeLeader() {
 		p.MatchIndex = 0
 		p.NextIndex = rf.entryLastIndex() + 1
 		p.RecentResponseTime = time.Now()
+		p.Pipeline = false
 	}
 	rf.Debugf("become leader")
 }

@@ -68,6 +68,7 @@ type PeerState struct {
 	NextIndex          int
 	MatchIndex         int
 	RecentResponseTime time.Time
+	Pipeline bool
 }
 
 // A Go object implementing a single Raft peer.
@@ -115,6 +116,9 @@ type Raft struct {
 	snapshotIndex int
 	snapshotTerm  int
 	snapshot      []byte
+
+	startTime time.Time
+	tickTime  time.Time
 }
 
 // return currentTerm and whether this server
@@ -265,7 +269,13 @@ func (rf *Raft) readSnapshot(data []byte) {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
-	rf.doSnapshot(index, clone(snapshot))
+	doneC := make(chan interface{})
+
+	rf.taskCh <- func() {
+		defer close(doneC)
+		rf.doSnapshot(index, clone(snapshot))
+	}
+	<-doneC
 }
 
 // example RequestVote RPC arguments structure.
@@ -336,6 +346,9 @@ func (rf *Raft) deleteConflictEntries(entries []*RaftEntry) (int, bool) {
 
 	for i = 0; i < len(entries); i++ {
 		index := entries[i].Index
+		if index <= rf.snapshotIndex {
+			continue
+		}
 		entry := rf.entryAt(index)
 		if entry == nil {
 			return i, true
@@ -369,8 +382,8 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 	rf.electionTime = time.Now()
 	rf.leaderSnapshotIndex = args.SnapshotIndex
 
-	rf.Debugf("recv append entries %d, local entries %d",
-		len(args.Entries), rf.entryLastIndex())
+	rf.Debugf("recv append entries %d, local entries %d/%d",
+		len(args.Entries), rf.entriesCompactionIndex, rf.entryLastIndex())
 
 	if !rf.checkPrevEntry(args.PrevLogIndex, args.PrevLogTerm) {
 		reply.Success = false
@@ -393,14 +406,17 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 	reply.Success = true
 	reply.LastLogIndex = rf.entryLastIndex()
 
-	if args.LeaderCommit > rf.commitIndex && args.LeaderCommit >= rf.entryLastIndex() {
-		rf.commitIndex = args.LeaderCommit
+	minCommit := args.LeaderCommit
+	if minCommit > rf.entryLastIndex() {
+		minCommit = rf.entryLastIndex()
+	}
+	if minCommit > rf.commitIndex {
+		rf.commitIndex = minCommit
 		rf.Debugf("update commit index %d", rf.commitIndex)
-
-		rf.triggerApply()
 	}
 
 	rf.currentLeader = args.LeaderId
+	rf.triggerApply()
 }
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshot, reply *InstallSnapshotReply) {
@@ -522,10 +538,16 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
 	doneC := make(chan interface{})
 
-	rf.taskCh <- func() {
+	select {
+	case rf.taskCh <- func() {
 		defer close(doneC)
 		rf.handelRequestVote(args, reply)
+	}:
+	default:
+		close(doneC)
+		rf.Debugf("add task failed")
 	}
+
 	<-doneC
 }
 
@@ -593,14 +615,15 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	rf.taskCh <- func() {
 		defer close(doneC)
-
 		entry := &RaftEntry{Term: rf.currentTerm, Index: rf.entryLastIndex() + 1, Command: command}
-
-		rf.Debugf("append entry at %d term %d command %v", entry.Index, entry.Term, command)
-		rf.entryAppend([]*RaftEntry{entry})
-		rf.broadCastEntries()
 		result.Index = entry.Index
 		result.Term = entry.Term
+
+		rf.Debugf("start entry at %d term %d command", entry.Index, entry.Term)
+		rf.entryAppend([]*RaftEntry{entry})
+		if entry.Index%2 == 0 {
+			rf.broadCastEntries()
+		}
 	}
 	<-doneC
 
@@ -627,6 +650,7 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) tick() {
+	rf.tickTime = time.Now()
 	switch rf.state {
 	case Leader:
 		rf.tickLeader()
@@ -642,7 +666,9 @@ func (rf *Raft) tick() {
 func (rf *Raft) ticker() {
 	ms := 50 * (rf.me + 1)
 	time.Sleep(time.Duration(ms) * time.Millisecond)
-	for rf.killed() == false {
+	tickTime:=time.Now().Add(rf.heartbeatTimeout)
+	tickTimeout :=rf.heartbeatTimeout
+	for !rf.killed() {
 
 		// Your code here (3A)
 		// Check if a leader election should be started.
@@ -654,10 +680,15 @@ func (rf *Raft) ticker() {
 		select {
 		case task := <-rf.taskCh:
 			task()
-		case <-time.After(rf.heartbeatTimeout):
+		case <-time.After(tickTimeout):
 			rf.tick()
 		}
-
+		if tickTime.After(time.Now()) {
+			tickTimeout = time.Until(tickTime)
+		} else {
+			tickTimeout = rf.heartbeatTimeout
+			tickTime = time.Now().Add(rf.heartbeatTimeout)
+		}
 	}
 }
 
@@ -684,9 +715,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = 0
 	rf.entries = make([]*RaftEntry, 0)
 	rf.entriesCompactionIndex = 0
-	rf.taskCh = make(chan func())
+	rf.taskCh = make(chan func(), 32)
 
-	rf.electionTimeout = 600 * time.Millisecond
+	rf.electionTimeout = 300 * time.Millisecond
 	rf.randomElectionTimeout = randomElectionTimeout(rf.electionTimeout)
 	rf.heartbeatTimeout = rf.electionTimeout / 3
 	rf.state = Follower
@@ -695,6 +726,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.electionTime = time.Now()
 	rf.snapshotIndex = 0
 	rf.snapshotTerm = 0
+	rf.startTime = time.Now()
+	rf.tickTime = time.Now()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -718,8 +751,35 @@ func randomElectionTimeout(electionTimeout time.Duration) time.Duration {
 	return electionTimeout + time.Duration(rand.Int63n(int64(electionTimeout)))
 }
 
+func (rf *Raft) getMinMatchIndex() int {
+	matchIndex := rf.entryLastIndex()
+	for i, p := range rf.peerStates {
+		if i == rf.me {
+			continue
+		}
+		if p.RecentResponseTime.Add(rf.heartbeatTimeout).Before(time.Now()) {
+			continue
+		}
+		if p.MatchIndex < matchIndex {
+			matchIndex = p.MatchIndex
+		}
+	}
+
+	return matchIndex
+}
+
+func (rf *Raft) shouldApply(index int) bool {
+	if rf.state == Follower {
+		return true
+	}
+	return index <= rf.getMinMatchIndex()
+}
+
 func (rf *Raft) triggerApply() {
 	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+		if !rf.shouldApply(i) {
+			break
+		}
 		entry := rf.entryAt(i)
 		if entry == nil {
 			rf.Errf("null entry at %d last %d", i, rf.entryLastIndex())
@@ -730,7 +790,11 @@ func (rf *Raft) triggerApply() {
 			panic("")
 		}
 		msg := ApplyMsg{CommandValid: true, Command: entry.Command, CommandIndex: entry.Index}
-		rf.applyCh <- msg
+		select {
+		case rf.applyCh <- msg:
+		case <-time.After(rf.electionTimeout):
+			return
+		}
 		rf.lastApplied += 1
 		rf.Debugf("update applied %d", rf.lastApplied)
 	}

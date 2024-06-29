@@ -5,6 +5,7 @@ import (
 )
 
 func (rf *Raft) doSnapshot(index int, snapshot []byte) {
+
 	rf.Debugf("take snapshot at %d bytes %d", index, len(snapshot))
 	entry := rf.entryAt(index)
 	if entry == nil {
@@ -47,6 +48,7 @@ func (rf *Raft) handleInstallSnapshot(args *InstallSnapshot, reply *InstallSnaps
 		rf.becomeFollower()
 		rf.updateTermAndVote(args.Term, 0)
 	}
+	rf.becomeFollower()
 	rf.currentTerm = args.Term
 	reply.Term = rf.currentTerm
 
