@@ -8,6 +8,8 @@ import (
 
 var mu sync.Mutex
 
+var enableDebug bool = false
+
 func (rf *Raft) stateToString(state int) string {
 	switch state {
 	case Leader:
@@ -21,15 +23,18 @@ func (rf *Raft) stateToString(state int) string {
 }
 
 func (rf *Raft) fmtString(format string, a ...any) string {
-	str := fmt.Sprintf("[%s %5.2fs]", time.Now().Local().Format("20060102 15:04:05.0000"),
+	str := fmt.Sprintf("[%s %6.3fs]", time.Now().Local().Format("20060102 15:04:05.0000"),
 		time.Since(rf.startTime).Seconds())
-	str += fmt.Sprintf("[%d-%s-%-2d] ", rf.me, rf.stateToString(rf.state), rf.currentTerm)
+	str += fmt.Sprintf("[%d-%s-%d-%d] ", rf.me, rf.stateToString(rf.state), rf.currentTerm,
+		len(rf.taskCh))
 	str += fmt.Sprintf(format, a...)
 	return str
 }
 
 func (rf *Raft) Debugf(format string, a ...any) (n int, err error) {
-	return 0, nil
+	if !enableDebug {
+		return
+	}
 	str := rf.fmtString(format, a...)
 	mu.Lock()
 	defer mu.Unlock()

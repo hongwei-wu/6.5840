@@ -1,5 +1,14 @@
 package raft
 
+import (
+	"bytes"
+	"fmt"
+)
+
+func (rf *Raft) entryFirstIndex() int {
+	return rf.entriesCompactionIndex + 1
+}
+
 func (rf *Raft) entryLastIndex() int {
 	return rf.entriesCompactionIndex + len(rf.entries)
 }
@@ -36,7 +45,7 @@ func (rf *Raft) entryPullFromIndex(index int) {
 		panic("")
 	}
 
-	if index > rf.entriesCompactionIndex+len(rf.entries)  {
+	if index > rf.entriesCompactionIndex+len(rf.entries) {
 		rf.entriesCompactionIndex = index
 		rf.entries = nil
 		return
@@ -47,6 +56,31 @@ func (rf *Raft) entryPullFromIndex(index int) {
 
 }
 
-func (rf *Raft)entryNum() int{
+func (rf *Raft) entryNum() int {
 	return len(rf.entries)
+}
+
+func (rf *Raft) entryDump() {
+	buf := bytes.NewBuffer(nil)
+	for i, e := range rf.entries {
+		if rf.entriesCompactionIndex+i+1 != e.Index {
+			panic(fmt.Sprintf("%d %d %d", rf.entriesCompactionIndex, i, e.Index))
+		}
+		buf.WriteString(fmt.Sprintf("%d/%d ", e.Index, e.Term))
+	}
+
+	rf.Debugf("entries %s", buf.String())
+}
+
+func (rf *Raft) entryGetTerm(index int, prevIndex int, prevTerm int, entries []*RaftEntry) int {
+	if index == prevIndex {
+		return prevTerm
+	}
+
+	for i, e := range entries {
+		if index == prevIndex+i+1 {
+			return e.Term
+		}
+	}
+	return 0
 }

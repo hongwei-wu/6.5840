@@ -7,6 +7,10 @@ import (
 func (rf *Raft) tickLeader() {
 	rf.brodcastHeartbeat()
 
+	if rf.electionTime.Add(rf.electionTimeout - rf.heartbeatTimeout).Before(time.Now()) {
+		rf.updateLeaderLease()
+	}
+
 	if !rf.isLeaderLeaseValid() {
 		rf.Debugf("step down")
 		rf.becomeFollower()
@@ -19,28 +23,40 @@ func (rf *Raft) tickLeader() {
 
 }
 
-func (rf *Raft) brodcastHeartbeat() {
-
+func (rf *Raft) updateLeaderLease() {
 	votes := 0
-	for i := range rf.peerStates {
-		if rf.state != Leader {
-			break
-		}
+	for i, p := range rf.peerStates {
 		if i == rf.me {
 			votes += 1
 			continue
 		}
-
-		if !rf.peerReplicateEntries(i, true) {
-			continue
+		if p.RecentRecv {
+			votes += 1
+			p.RecentRecv = false
 		}
-		votes += 1
 	}
-
 	if votes >= len(rf.peers)/2+1 {
 		rf.electionTime = time.Now()
 	} else {
 		rf.Debugf("recv only %d heartbeat response", votes)
+	}
+}
+
+func (rf *Raft) brodcastHeartbeat() {
+	for i, p := range rf.peerStates {
+		if rf.state != Leader {
+			break
+		}
+		if i == rf.me {
+			continue
+		}
+
+		if p.RecentSentTime.Add(rf.heartbeatTimeout).After(time.Now()) {
+			continue
+		}
+
+		p.RecentSentTime = time.Now()
+		rf.peerReplicateEntries(i)
 	}
 }
 
@@ -49,7 +65,7 @@ func (rf *Raft) isLeaderLeaseValid() bool {
 }
 
 func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshot, reply *InstallSnapshotReply) bool {
-	return rf.rpcCall(server, "Raft.InstallSnapshot", args, reply)
+	return rf.rpcCall(server, "Raft.InstallSnapshot", args, reply, rf.rpcTimeout)
 }
 
 func (rf *Raft) replicateSnapshot(i int, snapshotIndex int, snapshotTerm int) (*InstallSnapshotReply, bool) {
@@ -72,26 +88,42 @@ func (rf *Raft) replicateSnapshot(i int, snapshotIndex int, snapshotTerm int) (*
 	return &reply, ok
 }
 
-func (rf *Raft) peerReplicateSnapshot(i int) bool {
-	reply, ok := rf.replicateSnapshot(i, rf.snapshotIndex, rf.snapshotTerm)
-	if !ok {
-		return false
-	}
-
+func (rf *Raft) handleInstallSnapshotReply(i int, reply *InstallSnapshotReply) {
 	if reply.Term > rf.currentTerm {
 		rf.Debugf("aer bigger term %d", reply.Term)
 		rf.becomeFollower()
-		rf.updateTermAndVote(reply.Term, 0)
-		return false
+		rf.updateTermAndVote(reply.Term, -1)
+		return
+	}
+
+	if rf.state != Leader {
+		return
 	}
 
 	rf.peerStates[i].MatchIndex = rf.snapshotIndex
 	rf.peerStates[i].NextIndex = rf.snapshotIndex + 1
 	rf.peerStates[i].RecentResponseTime = time.Now()
 	rf.peerStates[i].Pipeline = true
-	rf.Debugf("updater peer %d match index %d next index %d", i,
+	rf.Debugf("update peer %d match index %d next index %d", i,
 		rf.snapshotIndex,
 		rf.snapshotIndex+1)
+	rf.peerReplicateEntries(i)
+}
+
+func (rf *Raft) peerReplicateSnapshot(i int) bool {
+	go func(i int) {
+		reply, ok := rf.replicateSnapshot(i, rf.snapshotIndex, rf.snapshotTerm)
+		if !ok {
+			return
+		}
+		select {
+		case <-rf.doneCh:
+		case rf.taskCh <- func() {
+			rf.handleInstallSnapshotReply(i, reply)
+		}:
+		}
+	}(i)
+
 	return true
 }
 
@@ -153,9 +185,94 @@ func (rf *Raft) updateCommit(index int) bool {
 	return false
 }
 
-func (rf *Raft) peerReplicateEntries(i int, retry bool) bool {
+func (rf *Raft) handleAppendEntriesReply(i int, reply *AppendEntriesReply, prevLogIndex int, prevLogTerm int) {
+
+	if reply.Term > rf.currentTerm {
+		rf.Debugf("aer bigger term %d", reply.Term)
+		rf.becomeFollower()
+		rf.updateTermAndVote(reply.Term, -1)
+		return
+	}
+	if rf.state != Leader {
+		return
+	}
+	p := rf.peerStates[i]
+	p.RecentRecv = true
+	p.RecentResponseTime = time.Now()
+	p.Applied = reply.Applied
+
+	if !reply.Success {
+		rf.Debugf("peer %d aer failed, prev %d/%d last %d match %d pipeline %t",
+			i, prevLogIndex, prevLogTerm, reply.LastLogIndex, p.MatchIndex, p.Pipeline)
+		if p.Pipeline {
+			p.MatchIndex = 0
+			p.NextIndex = rf.entryLastIndex()
+			p.RecentResponseTime = time.Now()
+			p.Pipeline = false
+			return
+		}
+
+		if prevLogIndex >= reply.LastLogIndex+1 {
+			p.NextIndex = reply.LastLogIndex + 1
+			rf.Debugf("peer %d reset next index %d", i, p.NextIndex)
+			return
+		}
+
+		for ; prevLogIndex > 0; prevLogIndex-- {
+			term := rf.entryGetTerm(prevLogIndex, rf.snapshotIndex, rf.snapshotTerm, rf.entries)
+			if term == 0 {
+				break
+			}
+
+			followerTerm := rf.entryGetTerm(prevLogIndex, reply.FollowerPreLogIndex, reply.FollowerPreLogTerm, reply.Entries)
+			if term == followerTerm {
+				break
+			}
+		}
+		p.NextIndex = prevLogIndex + 1
+		rf.Debugf("peer %d reset next index %d", i, p.NextIndex)
+		return
+	}
+
+	if rf.lastApplied < rf.commitIndex {
+		rf.triggerApply()
+	}
+
+	p.Pipeline = true
+	if reply.LastLogIndex > rf.entryLastIndex() {
+		reply.LastLogIndex = rf.entryLastIndex()
+		rf.Debugf("peer %d change lastLogIndex %d", i, reply.LastLogIndex)
+	}
+
+	if p.MatchIndex >= reply.LastLogIndex {
+		return
+	}
+	p.MatchIndex = reply.LastLogIndex
+	p.NextIndex = p.MatchIndex + 1
+	rf.Debugf("%d match index %d", i, p.MatchIndex)
+
+	entry := rf.entryAt(reply.LastLogIndex)
+	if entry == nil {
+		rf.Errf("entries %d %d reply.last %d",
+			rf.entriesCompactionIndex, rf.entryNum(), reply.LastLogIndex)
+		return
+
+	}
+	if entry.Term != rf.currentTerm {
+		return
+	}
+	commitIndex := rf.commitIndex
+	rf.updateCommit(p.MatchIndex)
+	if commitIndex != rf.commitIndex {
+		rf.broadCastEntries()
+		rf.triggerApply()
+	}
+}
+
+func (rf *Raft) peerReplicateEntries(i int) bool {
 	var prevLogIndex int
 	var prevLogTerm int
+
 	p := rf.peerStates[i]
 
 	if p.NextIndex == 1 {
@@ -179,80 +296,32 @@ func (rf *Raft) peerReplicateEntries(i int, retry bool) bool {
 		}
 	}
 	entries := rf.entryFromIndex(p.NextIndex)
-
-	reply, ok := rf.replicateEntries(i, prevLogIndex, prevLogTerm, entries, retry)
-	if !ok {
-		return false
-	}
-
-	p.RecentResponseTime = time.Now()
-	if reply.Term > rf.currentTerm {
-		rf.Debugf("aer bigger term %d", reply.Term)
-		rf.becomeFollower()
-		rf.updateTermAndVote(reply.Term, 0)
-		return false
-	}
-
-	if !reply.Success {
-		if p.Pipeline {
-			p.MatchIndex = 0
-			p.NextIndex = rf.entryLastIndex()
-			p.RecentResponseTime = time.Now()
-			p.Pipeline = false
-			return true
+	go func(i int) {
+		reply, ok := rf.replicateEntries(i, prevLogIndex, prevLogTerm, entries, false)
+		if !ok {
+			return
 		}
 
-		if prevLogIndex < reply.LastLogIndex + 1{
-			p.NextIndex = prevLogIndex
-		} else {
-		p.NextIndex = reply.LastLogIndex + 1
+		select {
+		case <-rf.doneCh:
+		case rf.taskCh <- func() {
+			rf.handleAppendEntriesReply(i, reply, prevLogIndex, prevLogTerm)
+		}:
 		}
-		return true
-	}
-
-
-	p.Pipeline = true
-	if reply.LastLogIndex > rf.entryLastIndex() {
-		reply.LastLogIndex = rf.entryLastIndex()
-		rf.Errf("peer %d change lastLogIndex %d", i, reply.LastLogIndex)
-	}
-
-	if p.MatchIndex >= reply.LastLogIndex {
-		return true
-	}
-	p.MatchIndex = reply.LastLogIndex
-	p.NextIndex = p.MatchIndex + 1
-	rf.Debugf("%d match index %d", i, p.MatchIndex)
-
-	entry := rf.entryAt(reply.LastLogIndex)
-	if entry == nil {
-		rf.Fatalf("entries %d %d reply.last %d",
-			rf.entriesCompactionIndex, rf.entryNum(), reply.LastLogIndex)
-
-	}
-	if entry.Term != rf.currentTerm {
-		return true
-	}
-	rf.updateCommit(p.MatchIndex)
+	}(i)
 
 	return true
 }
 
 func (rf *Raft) broadCastEntries() {
-again:
-	commitIndex := rf.commitIndex
-	for i := range rf.peerStates {
+	for i, p := range rf.peerStates {
 		if i == rf.me {
 			continue
 		}
-		rf.peerReplicateEntries(i, false)
+		p.RecentSentTime = time.Now()
+		rf.peerReplicateEntries(i)
 		if rf.state != Leader {
 			break
 		}
 	}
-
-	if commitIndex != rf.commitIndex {
-		goto again
-	}
-	rf.triggerApply()
 }

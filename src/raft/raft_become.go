@@ -17,7 +17,7 @@ func (rf *Raft)becomeCandidate(){
 	rf.electionTime = time.Now()
 	rf.randomElectionTimeout = randomElectionTimeout(rf.electionTimeout)
 
-	rf.Debugf("become candidate")
+	rf.Debugf("become candidate, random election timeout %s", rf.randomElectionTimeout.String())
 }
 
 func (rf *Raft) becomeLeader() {
@@ -34,6 +34,7 @@ func (rf *Raft) becomeLeader() {
 		p.NextIndex = rf.entryLastIndex() + 1
 		p.RecentResponseTime = time.Now()
 		p.Pipeline = false
+		p.RecentSentTime = time.Now().Add(-rf.heartbeatTimeout)
 	}
-	rf.Debugf("become leader")
+	rf.Debugf("become leader term %d", rf.currentTerm)
 }
