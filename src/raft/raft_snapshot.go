@@ -13,7 +13,7 @@ func (rf *Raft) doSnapshot(index int, snapshot []byte) {
 		return
 	}
 
-	rf.entryPullFromIndex(index)
+	rf.entryPullFromIndex(index - 1)
 	rf.snapshotIndex = index
 	rf.snapshotTerm = entry.Term
 	rf.snapshot =snapshot
@@ -23,10 +23,10 @@ func (rf *Raft) doSnapshot(index int, snapshot []byte) {
 
 func (rf *Raft) installSnapshot(snapshotIndex int, snapshotTerm int, snapshot []byte) {
 
+	rf.Debugf("install snapshot at index %d bytes %d", snapshotIndex, len(snapshot))
 	msg := ApplyMsg{SnapshotValid: true, SnapshotIndex: snapshotIndex, SnapshotTerm: snapshotTerm,
 		Snapshot: snapshot}
 	rf.applyCh <- msg
-	rf.Debugf("install snapshot at index %d bytes %d", snapshotIndex, len(snapshot))
 
 	rf.commitIndex = snapshotIndex
 	rf.lastApplied = snapshotIndex
@@ -46,7 +46,7 @@ func (rf *Raft) handleInstallSnapshot(args *InstallSnapshot, reply *InstallSnaps
 	if args.Term > rf.currentTerm {
 		rf.Debugf("snapshot bigger term %d", args.Term)
 		rf.becomeFollower()
-		rf.updateTermAndVote(args.Term, 0)
+		rf.updateTermAndVote(args.Term, -1)
 	}
 	rf.becomeFollower()
 	rf.currentTerm = args.Term
